@@ -1,0 +1,4 @@
+# Install on top of requirements.txt for CUDA acceleration.
+# These are the cuBLAS and cuDNN runtime wheels ctranslate2 needs on Windows.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
