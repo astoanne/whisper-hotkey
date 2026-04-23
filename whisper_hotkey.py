@@ -26,7 +26,8 @@ import pyperclip
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 HOTKEY = "f9"
-ALT_HOTKEY = "f8"  # 1 tap = correction, 2 tap = organize (for macropad key 2)
+ALT_HOTKEY = "f4"  # 1 tap = correction, 2 tap = organize (for macropad key 2)
+THIRD_HOTKEY = "f2"  # short tap = Enter, long hold = hammer backspace (for macropad key 3)
 QUIT_KEY = "f10"
 # COIDEA macropad dial emits these (set in the COIDEA GUI). F13-F15 are
 # unused on normal keyboards so they never collide with anything else.
@@ -137,6 +138,7 @@ models = {
 print(f"ready ({time.time()-_t:.1f}s)")
 print(f"{HOTKEY}: 1x=transcribe  2x=transcribe+organize  hold={LONG_TAP_THRESHOLD:.1f}s=organize current field")
 print(f"{ALT_HOTKEY}: 1x=correction  2x=organize current field")
+print(f"{THIRD_HOTKEY}: short=Enter  hold={LONG_TAP_THRESHOLD:.1f}s=hammer backspace until released")
 print(f"coidea dial ({COIDEA_DIAL_PRESS}/{COIDEA_DIAL_CW}/{COIDEA_DIAL_CCW}): press=WT tab-switch toggle  CW=redo  CCW=undo (terminal-aware)")
 print(f"quit:    {QUIT_KEY}\n")
 
@@ -163,6 +165,10 @@ state = {
     "alt_tap_count": 0,
     "alt_tap_timer": None,
     "alt_key_down": False,
+    "third_key_down": False,
+    "third_press_time": 0.0,
+    "third_held_long": False,
+    "third_long_timer": None,
     "tab_switch_mode": False,  # COIDEA dial: True = rotate switches WT tabs
 }
 lock = threading.Lock()
@@ -206,6 +212,62 @@ def call_organize(text: str) -> str | None:
 def call_correction(original: str, correction: str) -> str | None:
     user_msg = f"ORIGINAL: {original}\n\nCORRECTION: {correction}"
     return _ollama_chat(CORRECTION_SYSTEM, user_msg, tag="correction")
+
+
+def _select_field_and_copy():
+    """Select the whole current field and copy to clipboard. Terminal-aware.
+    Returns True if a copy was attempted."""
+    fam = _shell_family()
+    if fam == "psreadline":
+        # Ctrl+A is BeginningOfLine in PSReadLine, Ctrl+C is interrupt/cancel.
+        # Use Home + Shift+End to make a real selection, then Ctrl+Insert
+        # (the classic Windows copy shortcut -- PSReadLine binds it to Copy
+        # and TUI apps don't capture it as interrupt).
+        keyboard.send("home")
+        time.sleep(0.05)
+        keyboard.send("shift+end")
+        time.sleep(0.05)
+        keyboard.send("ctrl+insert")
+        time.sleep(0.20)
+        return True
+    if fam == "bash":
+        # mintty/bash readline has no reliable keyboard-only select-all+copy.
+        return False
+    keyboard.send("ctrl+a")
+    time.sleep(0.05)
+    keyboard.send("ctrl+c")
+    time.sleep(0.18)
+    return True
+
+
+def _select_field_and_paste():
+    """Select the whole current field and paste (replacing it)."""
+    fam = _shell_family()
+    if fam == "psreadline":
+        # Select the whole input line, delete it, then paste the new text.
+        # Ctrl+V alone doesn't reliably replace a selection in PSReadLine,
+        # so explicit Delete first.
+        keyboard.send("home")
+        time.sleep(0.05)
+        keyboard.send("shift+end")
+        time.sleep(0.05)
+        keyboard.send("delete")
+        time.sleep(0.05)
+        keyboard.send("ctrl+v")
+        time.sleep(0.10)
+        return
+    if fam == "bash":
+        keyboard.send("ctrl+a")
+        time.sleep(0.04)
+        keyboard.send("ctrl+k")
+        time.sleep(0.04)
+        keyboard.send("ctrl+v")
+        time.sleep(0.10)
+        return
+    keyboard.send("ctrl+a")
+    time.sleep(0.05)
+    keyboard.send("ctrl+v")
+    time.sleep(0.10)
 
 
 def start_recording(model_name: str, organize_after: bool, correction_of: bool = False):
@@ -259,24 +321,35 @@ def stop_and_transcribe():
 
     print(f"[OK] {dur:.1f}s audio, {elapsed:.2f}s infer, lang={lang} ({lang_prob:.2f}) -> {text}")
 
-    # correction mode: grab whole field, LLM revises using spoken correction, paste back
+    # correction mode: revise the previous dictation using the spoken correction
     if state["correction_of"]:
         state["correction_of"] = False
         saved_clip = pyperclip.paste()
-        keyboard.send("ctrl+a")
-        time.sleep(0.05)
-        keyboard.send("ctrl+c")
-        time.sleep(0.18)
-        original = pyperclip.paste()
-        if not original.strip():
-            print("[COR] field is empty -- pasting raw transcript instead")
-            pyperclip.copy(text)
+        fam = _shell_family()
+
+        if fam is not None:
+            # Terminal: can't reliably copy the field via keystrokes. Use the
+            # last dictation as ORIGINAL, then backspace exactly that many
+            # chars before pasting the revision.
+            original = state.get("last_dictation") or ""
+            if not original.strip():
+                print("[COR] terminal mode needs a prior dictation to correct -- skipped")
+                return
+            terminal_mode = True
+        else:
+            pyperclip.copy("")  # clear so we can detect copy failure
             time.sleep(0.02)
-            keyboard.send("ctrl+v")
-            time.sleep(0.1)
-            pyperclip.copy(saved_clip)
-            state["last_dictation"] = text
-            return
+            if not _select_field_and_copy():
+                print("[COR] can't grab field -- skipped")
+                pyperclip.copy(saved_clip)
+                return
+            original = pyperclip.paste()
+            if not original.strip():
+                print("[COR] field is empty -- skipped")
+                pyperclip.copy(saved_clip)
+                return
+            terminal_mode = False
+
         print(f"[COR] revising {len(original)} chars via LLM (correction: {text!r})...")
         t0 = time.time()
         revised = call_correction(original, text)
@@ -285,11 +358,21 @@ def stop_and_transcribe():
             pyperclip.copy(saved_clip)
             return
         print(f"[COR] {time.time()-t0:.1f}s -> {len(revised)} chars")
-        pyperclip.copy(revised)
-        keyboard.send("ctrl+a")
-        time.sleep(0.05)
-        keyboard.send("ctrl+v")
-        time.sleep(0.1)
+
+        if terminal_mode:
+            for _ in range(len(original)):
+                keyboard.send("backspace")
+                time.sleep(0.005)
+            time.sleep(0.05)
+            pyperclip.copy(revised)
+            time.sleep(0.05)
+            keyboard.send("ctrl+v")
+            time.sleep(0.10)
+        else:
+            pyperclip.copy(revised)
+            time.sleep(0.02)
+            _select_field_and_paste()
+
         pyperclip.copy(saved_clip)
         state["last_dictation"] = revised
         return
@@ -313,18 +396,30 @@ def stop_and_transcribe():
 
 def organize_current_field():
     saved_clip = pyperclip.paste()
-    keyboard.send("ctrl+a")
-    time.sleep(0.05)
-    keyboard.send("ctrl+c")
-    time.sleep(0.18)
-    original = pyperclip.paste()
+    fam = _shell_family()
 
-    if not original.strip():
-        print("[ORG] nothing in field to organize")
-        pyperclip.copy(saved_clip)
-        return
+    if fam is not None:
+        # Terminal: organize the last dictation, backspace those chars, paste cleaned.
+        original = state.get("last_dictation") or ""
+        if not original.strip():
+            print("[ORG] terminal mode needs a prior dictation to organize -- skipped")
+            return
+        terminal_mode = True
+    else:
+        pyperclip.copy("")  # clear so we can detect copy failure
+        time.sleep(0.02)
+        if not _select_field_and_copy():
+            print("[ORG] can't grab field -- skipped")
+            pyperclip.copy(saved_clip)
+            return
+        original = pyperclip.paste()
+        if not original.strip():
+            print("[ORG] field is empty -- skipped")
+            pyperclip.copy(saved_clip)
+            return
+        terminal_mode = False
 
-    print(f"[ORG] organizing {len(original)} chars of current field...")
+    print(f"[ORG] organizing {len(original)} chars...")
     t0 = time.time()
     cleaned = call_organize(original)
     if not cleaned:
@@ -332,12 +427,22 @@ def organize_current_field():
         pyperclip.copy(saved_clip)
         return
 
-    pyperclip.copy(cleaned)
-    keyboard.send("ctrl+a")
-    time.sleep(0.05)
-    keyboard.send("ctrl+v")
-    time.sleep(0.1)
-    pyperclip.copy(saved_clip)  # restore original clipboard
+    if terminal_mode:
+        for _ in range(len(original)):
+            keyboard.send("backspace")
+            time.sleep(0.005)
+        time.sleep(0.05)
+        pyperclip.copy(cleaned)
+        time.sleep(0.05)
+        keyboard.send("ctrl+v")
+        time.sleep(0.10)
+    else:
+        pyperclip.copy(cleaned)
+        time.sleep(0.02)
+        _select_field_and_paste()
+
+    pyperclip.copy(saved_clip)
+    state["last_dictation"] = cleaned
     print(f"[ORG] done in {time.time()-t0:.1f}s -> {len(cleaned)} chars")
 
 
@@ -443,6 +548,50 @@ def _on_alt_tap():
 
 
 keyboard.add_hotkey(ALT_HOTKEY, _on_alt_tap, suppress=True, trigger_on_release=False)
+
+
+# ---- third hotkey (macropad key 3): short = Enter, long hold = hammer backspace --
+_THIRD_REPEAT_INTERVAL = 0.03  # ~33 backspaces/sec while held past threshold
+
+def _on_third_press(e):
+    if state["third_key_down"]:
+        return  # ignore firmware/OS auto-repeat
+    state["third_key_down"] = True
+    state["third_press_time"] = time.time()
+    state["third_held_long"] = False
+
+    def start_repeat():
+        if not state["third_key_down"]:
+            return
+        state["third_held_long"] = True
+        print(f"[key3] long hold -> repeating backspace")
+        while state["third_key_down"]:
+            keyboard.send("backspace")
+            time.sleep(_THIRD_REPEAT_INTERVAL)
+
+    t = threading.Timer(LONG_TAP_THRESHOLD, start_repeat)
+    t.daemon = True
+    t.start()
+    state["third_long_timer"] = t
+
+
+def _on_third_release(e):
+    if not state["third_key_down"]:
+        return
+    state["third_key_down"] = False
+    hold = time.time() - state["third_press_time"]
+    if state["third_long_timer"] is not None:
+        state["third_long_timer"].cancel()
+        state["third_long_timer"] = None
+    if state["third_held_long"]:
+        print(f"[key3] release after {hold:.2f}s long-hold")
+    else:
+        print(f"[key3] short tap ({hold:.2f}s) -> Enter")
+        keyboard.send("enter")
+
+
+keyboard.on_press_key(THIRD_HOTKEY, _on_third_press, suppress=True)
+keyboard.on_release_key(THIRD_HOTKEY, _on_third_release, suppress=True)
 
 
 # ---- volume-dial gestures (keyboard media keys) --------------------------
