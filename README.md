@@ -102,6 +102,7 @@ All optional. Defaults in parentheses.
 | `WHISPER_COMPUTE` | `float16` on CUDA, `int8` on CPU | ctranslate2 compute type. Try `int8_float16` for lower VRAM on GPU |
 | `ORGANIZE_MODEL` | `llama3.2:3b` | Any Ollama model you've pulled |
 | `OLLAMA_URL` | `http://127.0.0.1:11434/api/chat` | Ollama chat endpoint |
+| `AUTO_PASTE` | `1` | `0` skips the `Ctrl+V` after dictation (copy-only) |
 
 ### CPU-only example
 
